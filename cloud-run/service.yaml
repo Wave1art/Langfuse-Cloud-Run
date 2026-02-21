@@ -1,0 +1,291 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# cloud-run/service.yaml  (Knative Serving format — used with `gcloud run services replace`)
+#
+# TEMPLATE — variables in ${...} are substituted by setup/03-deploy.sh via envsubst.
+#
+# Four containers in a single Cloud Run service:
+#   1. alloydb-omni   – AlloyDB Omni (PostgreSQL-compatible DB) with GCS WAL archiving
+#   2. valkey         – Valkey 7 (Redis-compatible, open-source Redis fork)
+#   3. langfuse-worker – Langfuse background job processor
+#   4. langfuse-web   – Langfuse Next.js frontend + REST/SDK API  ← ingress
+#
+# All containers share the same network namespace (localhost) and two ephemeral
+# disk volumes: one for AlloyDB data, one for Valkey data.
+#
+# minScale=1 + cpu-throttling=false keeps the instance alive so the in-process
+# database and cache sidecars remain available between requests.
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: ${SERVICE_NAME}
+  labels:
+    cloud.googleapis.com/location: ${REGION}
+  annotations:
+    # Multi-container sidecars require BETA launch stage
+    run.googleapis.com/launch-stage: BETA
+spec:
+  template:
+    metadata:
+      annotations:
+        # Always-on CPU — required so database/cache sidecars stay healthy
+        run.googleapis.com/cpu-throttling: 'false'
+        # Gen 2 execution environment — required for multi-container + volumes
+        run.googleapis.com/execution-environment: gen2
+        # Single instance: stateful sidecars cannot be horizontally scaled
+        autoscaling.knative.dev/minScale: '1'
+        autoscaling.knative.dev/maxScale: '1'
+        # Extra CPU during startup for DB restore / Langfuse migration
+        run.googleapis.com/startup-cpu-boost: 'true'
+    spec:
+      serviceAccountName: ${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
+      # ── Shared ephemeral volumes ────────────────────────────────────────────
+      volumes:
+        # Disk-backed (no medium specified) ephemeral volume for AlloyDB data.
+        # Data persists across requests but is LOST on instance restart.
+        # Durability comes from WAL archiving to GCS.
+        - name: alloydb-data
+          emptyDir:
+            sizeLimit: 20Gi
+        # Valkey RDB snapshots (optional persistence across requests)
+        - name: valkey-data
+          emptyDir:
+            sizeLimit: 2Gi
+
+      containers:
+        # ── 1. AlloyDB Omni ──────────────────────────────────────────────────
+        # Starts first; other containers depend on it being ready.
+        # On cold start: restores from GCS base backup then replays WAL.
+        # Ongoing: archives WAL segments to GCS every 5 min or on segment switch.
+        - name: alloydb-omni
+          image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPO}/alloydb-omni:latest
+          resources:
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data
+            - name: POSTGRES_USER
+              value: ${POSTGRES_USER}
+            - name: POSTGRES_DB
+              value: ${POSTGRES_DB}
+            - name: GCS_WAL_BUCKET
+              value: ${GCS_WAL_BUCKET}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-db-password
+                  key: latest
+          volumeMounts:
+            - name: alloydb-data
+              mountPath: /var/lib/postgresql/data
+          startupProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - ${POSTGRES_USER}
+                - -d
+                - ${POSTGRES_DB}
+            # Allow up to 10 min for WAL replay on a large archive
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 120
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - ${POSTGRES_USER}
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+        # ── 2. Valkey (Redis-compatible sidecar) ──────────────────────────────
+        # Valkey is the open-source continuation of Redis.
+        # Configured for LRU eviction (ideal for Langfuse's queue/cache usage).
+        # RDB snapshots written to /data every 60 s if >= 1 key changed.
+        - name: valkey
+          image: valkey/valkey:7-alpine
+          command: [valkey-server]
+          args:
+            - --save
+            - '60'
+            - '1'
+            - --loglevel
+            - notice
+            - --maxmemory
+            - 384mb
+            - --maxmemory-policy
+            - allkeys-lru
+            - --dir
+            - /data
+            # Disable AOF — RDB-only is sufficient for a cache/queue workload
+            - --appendonly
+            - 'no'
+            # Bind only to localhost (other containers share the network namespace)
+            - --bind
+            - '127.0.0.1'
+          resources:
+            limits:
+              cpu: '0.5'
+              memory: 512Mi
+          volumeMounts:
+            - name: valkey-data
+              mountPath: /data
+          startupProbe:
+            exec:
+              command: [valkey-cli, ping]
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 15
+            timeoutSeconds: 2
+          livenessProbe:
+            exec:
+              command: [valkey-cli, ping]
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+        # ── 3. Langfuse Worker (background job sidecar) ───────────────────────
+        # Processes async events, ingestion pipelines, and scheduled tasks.
+        - name: langfuse-worker
+          image: langfuse/langfuse-worker:3
+          resources:
+            limits:
+              cpu: '1'
+              memory: 1Gi
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-database-url
+                  key: latest
+            - name: REDIS_HOST
+              value: '127.0.0.1'
+            - name: REDIS_PORT
+              value: '6379'
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-encryption-key
+                  key: latest
+            - name: SALT
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-salt
+                  key: latest
+            - name: LANGFUSE_LOG_LEVEL
+              value: info
+            # GCS as the S3-compatible blob store for traces/media
+            - name: LANGFUSE_S3_MEDIA_UPLOAD_ENABLED
+              value: 'true'
+            - name: LANGFUSE_S3_MEDIA_UPLOAD_BUCKET
+              value: ${GCS_WAL_BUCKET}
+            - name: LANGFUSE_S3_ENDPOINT
+              value: https://storage.googleapis.com
+            - name: LANGFUSE_S3_REGION
+              value: auto
+            - name: LANGFUSE_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-gcs-hmac-key
+                  key: latest
+            - name: LANGFUSE_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-gcs-hmac-secret
+                  key: latest
+          # Worker must wait for DB and cache to be healthy
+          dependsOn:
+            - alloydb-omni
+            - valkey
+
+        # ── 4. Langfuse Web / API (ingress container) ─────────────────────────
+        # The only container that exposes a port — all external traffic enters here.
+        # Runs Langfuse's Next.js frontend and the public SDK/REST API.
+        - name: langfuse-web
+          image: langfuse/langfuse:3
+          ports:
+            - name: http1
+              containerPort: 3000
+          resources:
+            limits:
+              cpu: '2'
+              memory: 2Gi
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-database-url
+                  key: latest
+            - name: REDIS_HOST
+              value: '127.0.0.1'
+            - name: REDIS_PORT
+              value: '6379'
+            # Set to the Cloud Run service URL after first deploy
+            - name: NEXTAUTH_URL
+              value: https://${SERVICE_URL}
+            - name: NEXTAUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-nextauth-secret
+                  key: latest
+            - name: SALT
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-salt
+                  key: latest
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-encryption-key
+                  key: latest
+            - name: TELEMETRY_ENABLED
+              value: 'false'
+            - name: LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES
+              value: 'true'
+            # GCS blob store (same as worker)
+            - name: LANGFUSE_S3_MEDIA_UPLOAD_ENABLED
+              value: 'true'
+            - name: LANGFUSE_S3_MEDIA_UPLOAD_BUCKET
+              value: ${GCS_WAL_BUCKET}
+            - name: LANGFUSE_S3_ENDPOINT
+              value: https://storage.googleapis.com
+            - name: LANGFUSE_S3_REGION
+              value: auto
+            - name: LANGFUSE_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-gcs-hmac-key
+                  key: latest
+            - name: LANGFUSE_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-gcs-hmac-secret
+                  key: latest
+          dependsOn:
+            - alloydb-omni
+            - valkey
+          # Generous startup probe — Prisma migrations run on every boot
+          startupProbe:
+            httpGet:
+              path: /api/public/health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 24   # 4 minutes total
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/public/health
+              port: 3000
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+  traffic:
+    - percent: 100
+      latestRevision: true
