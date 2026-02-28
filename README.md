@@ -46,14 +46,76 @@ Maximum data loss window = the WAL archive lag, typically **< 5 minutes**.
 - Docker (for building the AlloyDB Omni image)
 - `envsubst` (part of `gettext`, available via `brew install gettext` or `apt install gettext-base`)
 
-## Quick Start
+## Deployment Variants
+
+Two variants are provided.  Choose based on your access level:
+
+| | **Secret Manager** (default) | **Plain env** (no Secret Manager) |
+|---|---|---|
+| Scripts | `01-gcp-resources.sh` + `03-deploy.sh` | `01-gcp-resources.plain-env.sh` + `03-deploy.plain-env.sh` |
+| Service spec | `cloud-run/service.yaml` | `cloud-run/service.plain-env.yaml` |
+| Secret storage | Cloud Secret Manager (versioned, audited) | Cloud Run service config (encrypted at rest) |
+| Who can read secrets | Principals with `secretmanager.secretAccessor` | Principals with `run.services.get` (broader) |
+| GCP APIs required | + `secretmanager.googleapis.com` | None beyond the defaults |
+
+Both variants use `envsubst` so secrets never appear in the git repository.
+
+---
+
+## Quick Start — Plain env (no Secret Manager)
 
 ### 1. Configure
 
 ```bash
 cp .env.example .env
-# Edit .env — fill in PROJECT_ID, REGION, and generate secrets:
-#   openssl rand -hex 32   (run once for each of NEXTAUTH_SECRET, SALT, ENCRYPTION_KEY, POSTGRES_PASSWORD)
+# Fill in PROJECT_ID, REGION, and generate secrets:
+openssl rand -hex 32   # run once each for NEXTAUTH_SECRET, SALT, ENCRYPTION_KEY, POSTGRES_PASSWORD
+```
+
+### 2. Create GCP resources
+
+```bash
+bash setup/01-gcp-resources.plain-env.sh
+```
+
+Creates the GCS bucket, Artifact Registry repo, service account, IAM bindings, and
+GCS HMAC key.  The HMAC key and `DATABASE_URL` are written back into your `.env`
+automatically.
+
+### 3. Build and push the AlloyDB Omni image
+
+```bash
+bash setup/02-build-and-push.sh
+```
+
+### 4. Deploy
+
+```bash
+bash setup/03-deploy.plain-env.sh
+```
+
+Secrets are expanded inline by `envsubst` into a `mktemp` file, deployed, then the
+file is immediately deleted.
+
+On the **first deploy** `NEXTAUTH_URL` uses a placeholder.  After the URL is printed:
+
+```bash
+# Add to .env:
+SERVICE_URL=your-service-abc123-uc.a.run.app
+
+# Re-deploy:
+bash setup/03-deploy.plain-env.sh
+```
+
+---
+
+## Quick Start — Secret Manager variant
+
+### 1. Configure
+
+```bash
+cp .env.example .env
+# Fill in PROJECT_ID, REGION, and generate secrets (same as above)
 ```
 
 ### 2. Create GCP resources
@@ -62,13 +124,9 @@ cp .env.example .env
 bash setup/01-gcp-resources.sh
 ```
 
-Creates:
-- Artifact Registry repository
-- GCS bucket (WAL archive + blob store)
-- Service account + IAM bindings
-- All secrets in Secret Manager
+Creates everything above **plus** stores all secrets in Cloud Secret Manager.
 
-### 3. Build and push the AlloyDB Omni image
+### 3. Build and push
 
 ```bash
 bash setup/02-build-and-push.sh
@@ -80,39 +138,32 @@ bash setup/02-build-and-push.sh
 bash setup/03-deploy.sh
 ```
 
-On the **first deploy** a placeholder `NEXTAUTH_URL` is used.  After the Cloud Run URL is printed:
-
-```bash
-# Add to .env:
-SERVICE_URL=your-service-abc123-uc.a.run.app
-
-# Re-deploy to set the correct NEXTAUTH_URL:
-bash setup/03-deploy.sh
-```
-
 ## File Structure
 
 ```
 Langfuse-Cloud-Run/
-├── .env.example                          Template for environment variables
+├── .env.example                              Template for environment variables
 │
 ├── alloydb-omni/
-│   ├── Dockerfile                        AlloyDB Omni + gcloud CLI
-│   ├── entrypoint-wrapper.sh             GCS restore logic (runs before initdb)
+│   ├── Dockerfile                            AlloyDB Omni + gcloud CLI
+│   ├── entrypoint-wrapper.sh                 GCS restore logic (runs before initdb)
 │   └── initdb.d/
-│       └── 01-configure-wal-archiving.sh WAL archiving setup + first base backup
+│       └── 01-configure-wal-archiving.sh     WAL archiving setup + first base backup
 │
 ├── cloud-run/
-│   └── service.yaml                      Multi-container Cloud Run spec (template)
+│   ├── service.yaml                          Cloud Run spec — Secret Manager variant
+│   └── service.plain-env.yaml               Cloud Run spec — plain env variant
 │
 ├── scripts/
-│   ├── backup-now.sh                     Trigger an on-demand base backup
-│   └── restore-from-archive.sh          Restore to a local container (PITR)
+│   ├── backup-now.sh                         Trigger an on-demand base backup
+│   └── restore-from-archive.sh              Restore to a local container (PITR)
 │
 └── setup/
-    ├── 01-gcp-resources.sh              Create GCP infrastructure
-    ├── 02-build-and-push.sh             Build and push AlloyDB Omni image
-    └── 03-deploy.sh                     Deploy / update Cloud Run service
+    ├── 01-gcp-resources.sh                  GCP infra + Secret Manager secrets
+    ├── 01-gcp-resources.plain-env.sh        GCP infra only (no Secret Manager)
+    ├── 02-build-and-push.sh                 Build and push AlloyDB Omni image (shared)
+    ├── 03-deploy.sh                         Deploy — Secret Manager variant
+    └── 03-deploy.plain-env.sh              Deploy — plain env variant
 ```
 
 ## Operations
