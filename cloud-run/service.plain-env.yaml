@@ -195,10 +195,12 @@ spec:
             - name: SALT
               value: ${SALT}
             # ClickHouse — required by Langfuse v3+
+            # CLICKHOUSE_URL      → HTTP interface  (@clickhouse/client)     port 8123
+            # CLICKHOUSE_MIGRATION_URL → native TCP (migration runner)       port 9000
             - name: CLICKHOUSE_URL
               value: http://127.0.0.1:8123
             - name: CLICKHOUSE_MIGRATION_URL
-              value: http://127.0.0.1:8123
+              value: clickhouse://127.0.0.1:9000
             - name: CLICKHOUSE_USER
               value: default
             - name: CLICKHOUSE_PASSWORD
@@ -248,10 +250,12 @@ spec:
             - name: ENCRYPTION_KEY
               value: ${ENCRYPTION_KEY}
             # ClickHouse — required by Langfuse v3+
+            # CLICKHOUSE_URL      → HTTP interface  (@clickhouse/client)     port 8123
+            # CLICKHOUSE_MIGRATION_URL → native TCP (migration runner)       port 9000
             - name: CLICKHOUSE_URL
               value: http://127.0.0.1:8123
             - name: CLICKHOUSE_MIGRATION_URL
-              value: http://127.0.0.1:8123
+              value: clickhouse://127.0.0.1:9000
             - name: CLICKHOUSE_USER
               value: default
             - name: CLICKHOUSE_PASSWORD
