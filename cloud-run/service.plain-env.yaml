@@ -1,0 +1,232 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# cloud-run/service.plain-env.yaml  (Knative Serving format)
+#
+# VARIANT — no Secret Manager dependency.
+# All secret values are substituted inline by setup/03-deploy.plain-env.sh
+# using envsubst.  The rendered file is deleted immediately after deployment.
+#
+# Variables substituted at deploy time:
+#   Infrastructure  : PROJECT_ID  REGION  SERVICE_NAME  ARTIFACT_REGISTRY_REPO
+#                     GCS_WAL_BUCKET  SERVICE_ACCOUNT_NAME  SERVICE_URL
+#   DB credentials  : POSTGRES_USER  POSTGRES_DB  POSTGRES_PASSWORD  DATABASE_URL
+#   App secrets     : NEXTAUTH_SECRET  SALT  ENCRYPTION_KEY
+#   GCS HMAC keys   : GCS_HMAC_ACCESS_KEY  GCS_HMAC_SECRET_KEY
+#
+# Security notes:
+#   • Values are encrypted at rest inside Cloud Run's service configuration.
+#   • Anyone with roles/run.viewer (or higher) on the project can read these
+#     values via the Console or gcloud — tighten project IAM accordingly.
+#   • For stricter secret isolation, use the Secret Manager variant
+#     (cloud-run/service.yaml + setup/01-gcp-resources.sh).
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: ${SERVICE_NAME}
+  labels:
+    cloud.googleapis.com/location: ${REGION}
+  annotations:
+    run.googleapis.com/launch-stage: BETA
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/cpu-throttling: 'false'
+        run.googleapis.com/execution-environment: gen2
+        autoscaling.knative.dev/minScale: '1'
+        autoscaling.knative.dev/maxScale: '1'
+        run.googleapis.com/startup-cpu-boost: 'true'
+    spec:
+      serviceAccountName: ${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
+      volumes:
+        - name: alloydb-data
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: valkey-data
+          emptyDir:
+            sizeLimit: 2Gi
+
+      containers:
+        # ── 1. AlloyDB Omni ──────────────────────────────────────────────────
+        - name: alloydb-omni
+          image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPO}/alloydb-omni:latest
+          resources:
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data
+            - name: POSTGRES_USER
+              value: ${POSTGRES_USER}
+            - name: POSTGRES_DB
+              value: ${POSTGRES_DB}
+            - name: POSTGRES_PASSWORD
+              value: ${POSTGRES_PASSWORD}
+            - name: GCS_WAL_BUCKET
+              value: ${GCS_WAL_BUCKET}
+          volumeMounts:
+            - name: alloydb-data
+              mountPath: /var/lib/postgresql/data
+          startupProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - ${POSTGRES_USER}
+                - -d
+                - ${POSTGRES_DB}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 120
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - ${POSTGRES_USER}
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+        # ── 2. Valkey (Redis-compatible sidecar) ──────────────────────────────
+        - name: valkey
+          image: valkey/valkey:7-alpine
+          command: [valkey-server]
+          args:
+            - --save
+            - '60'
+            - '1'
+            - --loglevel
+            - notice
+            - --maxmemory
+            - 384mb
+            - --maxmemory-policy
+            - allkeys-lru
+            - --dir
+            - /data
+            - --appendonly
+            - 'no'
+            - --bind
+            - '127.0.0.1'
+          resources:
+            limits:
+              cpu: '0.5'
+              memory: 512Mi
+          volumeMounts:
+            - name: valkey-data
+              mountPath: /data
+          startupProbe:
+            exec:
+              command: [valkey-cli, ping]
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 15
+            timeoutSeconds: 2
+          livenessProbe:
+            exec:
+              command: [valkey-cli, ping]
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+        # ── 3. Langfuse Worker ────────────────────────────────────────────────
+        - name: langfuse-worker
+          image: langfuse/langfuse-worker:3
+          resources:
+            limits:
+              cpu: '1'
+              memory: 1Gi
+          env:
+            - name: DATABASE_URL
+              value: ${DATABASE_URL}
+            - name: REDIS_HOST
+              value: '127.0.0.1'
+            - name: REDIS_PORT
+              value: '6379'
+            - name: ENCRYPTION_KEY
+              value: ${ENCRYPTION_KEY}
+            - name: SALT
+              value: ${SALT}
+            - name: LANGFUSE_LOG_LEVEL
+              value: info
+            - name: LANGFUSE_S3_MEDIA_UPLOAD_ENABLED
+              value: 'true'
+            - name: LANGFUSE_S3_MEDIA_UPLOAD_BUCKET
+              value: ${GCS_WAL_BUCKET}
+            - name: LANGFUSE_S3_ENDPOINT
+              value: https://storage.googleapis.com
+            - name: LANGFUSE_S3_REGION
+              value: auto
+            - name: LANGFUSE_S3_ACCESS_KEY_ID
+              value: ${GCS_HMAC_ACCESS_KEY}
+            - name: LANGFUSE_S3_SECRET_ACCESS_KEY
+              value: ${GCS_HMAC_SECRET_KEY}
+          dependsOn:
+            - alloydb-omni
+            - valkey
+
+        # ── 4. Langfuse Web / API (ingress) ───────────────────────────────────
+        - name: langfuse-web
+          image: langfuse/langfuse:3
+          ports:
+            - name: http1
+              containerPort: 3000
+          resources:
+            limits:
+              cpu: '2'
+              memory: 2Gi
+          env:
+            - name: DATABASE_URL
+              value: ${DATABASE_URL}
+            - name: REDIS_HOST
+              value: '127.0.0.1'
+            - name: REDIS_PORT
+              value: '6379'
+            - name: NEXTAUTH_URL
+              value: https://${SERVICE_URL}
+            - name: NEXTAUTH_SECRET
+              value: ${NEXTAUTH_SECRET}
+            - name: SALT
+              value: ${SALT}
+            - name: ENCRYPTION_KEY
+              value: ${ENCRYPTION_KEY}
+            - name: TELEMETRY_ENABLED
+              value: 'false'
+            - name: LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES
+              value: 'true'
+            - name: LANGFUSE_S3_MEDIA_UPLOAD_ENABLED
+              value: 'true'
+            - name: LANGFUSE_S3_MEDIA_UPLOAD_BUCKET
+              value: ${GCS_WAL_BUCKET}
+            - name: LANGFUSE_S3_ENDPOINT
+              value: https://storage.googleapis.com
+            - name: LANGFUSE_S3_REGION
+              value: auto
+            - name: LANGFUSE_S3_ACCESS_KEY_ID
+              value: ${GCS_HMAC_ACCESS_KEY}
+            - name: LANGFUSE_S3_SECRET_ACCESS_KEY
+              value: ${GCS_HMAC_SECRET_KEY}
+          dependsOn:
+            - alloydb-omni
+            - valkey
+          startupProbe:
+            httpGet:
+              path: /api/public/health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 24
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/public/health
+              port: 3000
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+  traffic:
+    - percent: 100
+      latestRevision: true
