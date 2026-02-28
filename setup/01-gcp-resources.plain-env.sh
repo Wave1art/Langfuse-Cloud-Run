@@ -127,6 +127,9 @@ POSTGRES_DB="${POSTGRES_DB:-langfuse}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}"
 DB_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}"
 
+# Validate ClickHouse password is set
+: "${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set in .env (generate with: openssl rand -hex 32)}"
+
 update_env_var() {
   local key="$1" val="$2"
   if grep -q "^${key}=" "${ENV_FILE}" 2>/dev/null; then

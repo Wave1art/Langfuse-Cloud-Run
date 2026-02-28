@@ -28,6 +28,7 @@ source "${ROOT_DIR}/.env"
 
 IMAGE_BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPO}"
 ALLOYDB_IMAGE="${IMAGE_BASE}/alloydb-omni:latest"
+CLICKHOUSE_IMAGE="${IMAGE_BASE}/clickhouse:latest"
 
 echo "==> Configuring Docker auth for Artifact Registry..."
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
@@ -38,9 +39,18 @@ docker build \
   --tag "${ALLOYDB_IMAGE}" \
   "${ROOT_DIR}/alloydb-omni"
 
-echo "==> Pushing ${ALLOYDB_IMAGE}..."
+echo "==> Building ClickHouse image: ${CLICKHOUSE_IMAGE}"
+docker build \
+  --platform linux/amd64 \
+  --tag "${CLICKHOUSE_IMAGE}" \
+  "${ROOT_DIR}/clickhouse"
+
+echo "==> Pushing images..."
 docker push "${ALLOYDB_IMAGE}"
+docker push "${CLICKHOUSE_IMAGE}"
 
 echo ""
-echo "✓ Image pushed: ${ALLOYDB_IMAGE}"
+echo "✓ Images pushed:"
+echo "  ${ALLOYDB_IMAGE}"
+echo "  ${CLICKHOUSE_IMAGE}"
 echo "  Next step: bash setup/03-deploy.sh"

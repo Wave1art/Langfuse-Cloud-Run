@@ -3,17 +3,15 @@
 #
 # TEMPLATE — variables in ${...} are substituted by setup/03-deploy.sh via envsubst.
 #
-# Four containers in a single Cloud Run service:
-#   1. alloydb-omni   – AlloyDB Omni (PostgreSQL-compatible DB) with GCS WAL archiving
-#   2. valkey         – Valkey 7 (Redis-compatible, open-source Redis fork)
-#   3. langfuse-worker – Langfuse background job processor
-#   4. langfuse-web   – Langfuse Next.js frontend + REST/SDK API  ← ingress
+# Five containers in a single Cloud Run service:
+#   1. alloydb-omni   – AlloyDB Omni (PostgreSQL) — OLTP, GCS WAL archiving
+#   2. clickhouse     – ClickHouse 24 — OLAP, required by Langfuse v3+
+#   3. valkey         – Valkey 7 (Redis-compatible)
+#   4. langfuse-worker – Background job processor
+#   5. langfuse-web   – Next.js UI + REST/SDK API  ← ingress
 #
-# All containers share the same network namespace (localhost) and two ephemeral
-# disk volumes: one for AlloyDB data, one for Valkey data.
-#
-# minScale=1 + cpu-throttling=false keeps the instance alive so the in-process
-# database and cache sidecars remain available between requests.
+# All containers share the same localhost network namespace and ephemeral disk
+# volumes.  minScale=1 + cpu-throttling=false keeps the instance always alive.
 # ──────────────────────────────────────────────────────────────────────────────
 apiVersion: serving.knative.dev/v1
 kind: Service
@@ -22,41 +20,35 @@ metadata:
   labels:
     cloud.googleapis.com/location: ${REGION}
   annotations:
-    # Multi-container sidecars require BETA launch stage
     run.googleapis.com/launch-stage: BETA
 spec:
   template:
     metadata:
       annotations:
-        # Always-on CPU — required so database/cache sidecars stay healthy
         run.googleapis.com/cpu-throttling: 'false'
-        # Gen 2 execution environment — required for multi-container + volumes
         run.googleapis.com/execution-environment: gen2
-        # Single instance: stateful sidecars cannot be horizontally scaled
         autoscaling.knative.dev/minScale: '1'
         autoscaling.knative.dev/maxScale: '1'
-        # Extra CPU during startup for DB restore / Langfuse migration
         run.googleapis.com/startup-cpu-boost: 'true'
     spec:
       serviceAccountName: ${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
       # ── Shared ephemeral volumes ────────────────────────────────────────────
       volumes:
-        # Disk-backed (no medium specified) ephemeral volume for AlloyDB data.
-        # Data persists across requests but is LOST on instance restart.
-        # Durability comes from WAL archiving to GCS.
         - name: alloydb-data
           emptyDir:
             sizeLimit: 20Gi
-        # Valkey RDB snapshots (optional persistence across requests)
+        - name: clickhouse-data
+          emptyDir:
+            sizeLimit: 30Gi
         - name: valkey-data
           emptyDir:
             sizeLimit: 2Gi
 
       containers:
         # ── 1. AlloyDB Omni ──────────────────────────────────────────────────
-        # Starts first; other containers depend on it being ready.
+        # OLTP store: users, projects, API keys, settings.
         # On cold start: restores from GCS base backup then replays WAL.
-        # Ongoing: archives WAL segments to GCS every 5 min or on segment switch.
+        # Ongoing: archives WAL segments to GCS every ≤5 min.
         - name: alloydb-omni
           image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPO}/alloydb-omni:latest
           resources:
@@ -88,10 +80,9 @@ spec:
                 - ${POSTGRES_USER}
                 - -d
                 - ${POSTGRES_DB}
-            # Allow up to 10 min for WAL replay on a large archive
             initialDelaySeconds: 10
             periodSeconds: 5
-            failureThreshold: 120
+            failureThreshold: 120   # up to 10 min for WAL replay
             timeoutSeconds: 3
           livenessProbe:
             exec:
@@ -103,10 +94,59 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
 
-        # ── 2. Valkey (Redis-compatible sidecar) ──────────────────────────────
-        # Valkey is the open-source continuation of Redis.
-        # Configured for LRU eviction (ideal for Langfuse's queue/cache usage).
-        # RDB snapshots written to /data every 60 s if >= 1 key changed.
+        # ── 2. ClickHouse ─────────────────────────────────────────────────────
+        # OLAP store: traces, observations, sessions, scores.
+        # Required by Langfuse v3+ — not optional.
+        # On cold start: if a GCS backup exists the entrypoint-wrapper starts CH,
+        # runs RESTORE ALL FROM S3(...), then re-execs CH as PID 1.
+        - name: clickhouse
+          image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPO}/clickhouse:latest
+          resources:
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+            - name: GCS_WAL_BUCKET
+              value: ${GCS_WAL_BUCKET}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-clickhouse-password
+                  key: latest
+            - name: GCS_HMAC_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-gcs-hmac-key
+                  key: latest
+            - name: GCS_HMAC_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-gcs-hmac-secret
+                  key: latest
+          volumeMounts:
+            - name: clickhouse-data
+              mountPath: /var/lib/clickhouse
+          startupProbe:
+            exec:
+              command:
+                - clickhouse-client
+                - --query
+                - SELECT 1
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 120   # up to 10 min for large backup restore
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - clickhouse-client
+                - --query
+                - SELECT 1
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+        # ── 3. Valkey (Redis-compatible sidecar) ──────────────────────────────
         - name: valkey
           image: valkey/valkey:7-alpine
           command: [valkey-server]
@@ -122,10 +162,8 @@ spec:
             - allkeys-lru
             - --dir
             - /data
-            # Disable AOF — RDB-only is sufficient for a cache/queue workload
             - --appendonly
             - 'no'
-            # Bind only to localhost (other containers share the network namespace)
             - --bind
             - '127.0.0.1'
           resources:
@@ -149,8 +187,7 @@ spec:
             timeoutSeconds: 3
             failureThreshold: 3
 
-        # ── 3. Langfuse Worker (background job sidecar) ───────────────────────
-        # Processes async events, ingestion pipelines, and scheduled tasks.
+        # ── 4. Langfuse Worker (background job sidecar) ───────────────────────
         - name: langfuse-worker
           image: langfuse/langfuse-worker:3
           resources:
@@ -177,9 +214,21 @@ spec:
                 secretKeyRef:
                   name: langfuse-salt
                   key: latest
+            # ClickHouse — required by Langfuse v3+
+            - name: CLICKHOUSE_URL
+              value: http://127.0.0.1:8123
+            - name: CLICKHOUSE_MIGRATION_URL
+              value: http://127.0.0.1:8123
+            - name: CLICKHOUSE_USER
+              value: default
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-clickhouse-password
+                  key: latest
             - name: LANGFUSE_LOG_LEVEL
               value: info
-            # GCS as the S3-compatible blob store for traces/media
+            # GCS as S3-compatible blob store
             - name: LANGFUSE_S3_MEDIA_UPLOAD_ENABLED
               value: 'true'
             - name: LANGFUSE_S3_MEDIA_UPLOAD_BUCKET
@@ -198,14 +247,12 @@ spec:
                 secretKeyRef:
                   name: langfuse-gcs-hmac-secret
                   key: latest
-          # Worker must wait for DB and cache to be healthy
           dependsOn:
             - alloydb-omni
+            - clickhouse
             - valkey
 
-        # ── 4. Langfuse Web / API (ingress container) ─────────────────────────
-        # The only container that exposes a port — all external traffic enters here.
-        # Runs Langfuse's Next.js frontend and the public SDK/REST API.
+        # ── 5. Langfuse Web / API (ingress container) ─────────────────────────
         - name: langfuse-web
           image: langfuse/langfuse:3
           ports:
@@ -225,7 +272,6 @@ spec:
               value: '127.0.0.1'
             - name: REDIS_PORT
               value: '6379'
-            # Set to the Cloud Run service URL after first deploy
             - name: NEXTAUTH_URL
               value: https://${SERVICE_URL}
             - name: NEXTAUTH_SECRET
@@ -243,11 +289,23 @@ spec:
                 secretKeyRef:
                   name: langfuse-encryption-key
                   key: latest
+            # ClickHouse — required by Langfuse v3+
+            - name: CLICKHOUSE_URL
+              value: http://127.0.0.1:8123
+            - name: CLICKHOUSE_MIGRATION_URL
+              value: http://127.0.0.1:8123
+            - name: CLICKHOUSE_USER
+              value: default
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-clickhouse-password
+                  key: latest
             - name: TELEMETRY_ENABLED
               value: 'false'
             - name: LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES
               value: 'true'
-            # GCS blob store (same as worker)
+            # GCS blob store
             - name: LANGFUSE_S3_MEDIA_UPLOAD_ENABLED
               value: 'true'
             - name: LANGFUSE_S3_MEDIA_UPLOAD_BUCKET
@@ -268,15 +326,15 @@ spec:
                   key: latest
           dependsOn:
             - alloydb-omni
+            - clickhouse
             - valkey
-          # Generous startup probe — Prisma migrations run on every boot
           startupProbe:
             httpGet:
               path: /api/public/health
               port: 3000
             initialDelaySeconds: 30
             periodSeconds: 10
-            failureThreshold: 24   # 4 minutes total
+            failureThreshold: 24   # 4 minutes
             timeoutSeconds: 5
           livenessProbe:
             httpGet:

@@ -34,6 +34,7 @@ source "${ROOT_DIR}/.env"
 : "${POSTGRES_PASSWORD:?}"
 : "${POSTGRES_USER:?}"
 : "${POSTGRES_DB:?}"
+: "${CLICKHOUSE_PASSWORD:?}"
 
 echo "==> Setting project to ${PROJECT_ID}"
 gcloud config set project "${PROJECT_ID}"
@@ -122,11 +123,12 @@ create_or_update_secret() {
 # Database connection URL (used by Langfuse web and worker)
 DB_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}"
 
-create_or_update_secret "langfuse-db-password"      "${POSTGRES_PASSWORD}"
-create_or_update_secret "langfuse-database-url"     "${DB_URL}"
-create_or_update_secret "langfuse-nextauth-secret"  "${NEXTAUTH_SECRET}"
-create_or_update_secret "langfuse-salt"             "${SALT}"
-create_or_update_secret "langfuse-encryption-key"   "${ENCRYPTION_KEY}"
+create_or_update_secret "langfuse-db-password"        "${POSTGRES_PASSWORD}"
+create_or_update_secret "langfuse-database-url"       "${DB_URL}"
+create_or_update_secret "langfuse-nextauth-secret"    "${NEXTAUTH_SECRET}"
+create_or_update_secret "langfuse-salt"               "${SALT}"
+create_or_update_secret "langfuse-encryption-key"     "${ENCRYPTION_KEY}"
+create_or_update_secret "langfuse-clickhouse-password" "${CLICKHOUSE_PASSWORD}"
 
 # ── HMAC key for GCS S3-compatible API (Langfuse blob storage) ───────────────
 echo "==> Creating HMAC key for GCS S3 interoperability..."

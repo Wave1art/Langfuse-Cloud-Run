@@ -9,6 +9,7 @@
 #   Infrastructure  : PROJECT_ID  REGION  SERVICE_NAME  ARTIFACT_REGISTRY_REPO
 #                     GCS_WAL_BUCKET  SERVICE_ACCOUNT_NAME  SERVICE_URL
 #   DB credentials  : POSTGRES_USER  POSTGRES_DB  POSTGRES_PASSWORD  DATABASE_URL
+#   ClickHouse      : CLICKHOUSE_PASSWORD
 #   App secrets     : NEXTAUTH_SECRET  SALT  ENCRYPTION_KEY
 #   GCS HMAC keys   : GCS_HMAC_ACCESS_KEY  GCS_HMAC_SECRET_KEY
 #
@@ -42,6 +43,9 @@ spec:
         - name: alloydb-data
           emptyDir:
             sizeLimit: 20Gi
+        - name: clickhouse-data
+          emptyDir:
+            sizeLimit: 30Gi
         - name: valkey-data
           emptyDir:
             sizeLimit: 2Gi
@@ -90,7 +94,48 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
 
-        # ── 2. Valkey (Redis-compatible sidecar) ──────────────────────────────
+        # ── 2. ClickHouse ─────────────────────────────────────────────────────
+        # OLAP store: traces, observations, sessions, scores.
+        # Required by Langfuse v3+ — not optional.
+        - name: clickhouse
+          image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPO}/clickhouse:latest
+          resources:
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+            - name: GCS_WAL_BUCKET
+              value: ${GCS_WAL_BUCKET}
+            - name: CLICKHOUSE_PASSWORD
+              value: ${CLICKHOUSE_PASSWORD}
+            - name: GCS_HMAC_ACCESS_KEY
+              value: ${GCS_HMAC_ACCESS_KEY}
+            - name: GCS_HMAC_SECRET_KEY
+              value: ${GCS_HMAC_SECRET_KEY}
+          volumeMounts:
+            - name: clickhouse-data
+              mountPath: /var/lib/clickhouse
+          startupProbe:
+            exec:
+              command:
+                - clickhouse-client
+                - --query
+                - SELECT 1
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 120
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - clickhouse-client
+                - --query
+                - SELECT 1
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+        # ── 3. Valkey (Redis-compatible sidecar) ──────────────────────────────
         - name: valkey
           image: valkey/valkey:7-alpine
           command: [valkey-server]
@@ -131,7 +176,7 @@ spec:
             timeoutSeconds: 3
             failureThreshold: 3
 
-        # ── 3. Langfuse Worker ────────────────────────────────────────────────
+        # ── 4. Langfuse Worker ────────────────────────────────────────────────
         - name: langfuse-worker
           image: langfuse/langfuse-worker:3
           resources:
@@ -149,6 +194,15 @@ spec:
               value: ${ENCRYPTION_KEY}
             - name: SALT
               value: ${SALT}
+            # ClickHouse — required by Langfuse v3+
+            - name: CLICKHOUSE_URL
+              value: http://127.0.0.1:8123
+            - name: CLICKHOUSE_MIGRATION_URL
+              value: http://127.0.0.1:8123
+            - name: CLICKHOUSE_USER
+              value: default
+            - name: CLICKHOUSE_PASSWORD
+              value: ${CLICKHOUSE_PASSWORD}
             - name: LANGFUSE_LOG_LEVEL
               value: info
             - name: LANGFUSE_S3_MEDIA_UPLOAD_ENABLED
@@ -165,9 +219,10 @@ spec:
               value: ${GCS_HMAC_SECRET_KEY}
           dependsOn:
             - alloydb-omni
+            - clickhouse
             - valkey
 
-        # ── 4. Langfuse Web / API (ingress) ───────────────────────────────────
+        # ── 5. Langfuse Web / API (ingress) ───────────────────────────────────
         - name: langfuse-web
           image: langfuse/langfuse:3
           ports:
@@ -192,6 +247,15 @@ spec:
               value: ${SALT}
             - name: ENCRYPTION_KEY
               value: ${ENCRYPTION_KEY}
+            # ClickHouse — required by Langfuse v3+
+            - name: CLICKHOUSE_URL
+              value: http://127.0.0.1:8123
+            - name: CLICKHOUSE_MIGRATION_URL
+              value: http://127.0.0.1:8123
+            - name: CLICKHOUSE_USER
+              value: default
+            - name: CLICKHOUSE_PASSWORD
+              value: ${CLICKHOUSE_PASSWORD}
             - name: TELEMETRY_ENABLED
               value: 'false'
             - name: LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES
@@ -210,6 +274,7 @@ spec:
               value: ${GCS_HMAC_SECRET_KEY}
           dependsOn:
             - alloydb-omni
+            - clickhouse
             - valkey
           startupProbe:
             httpGet:

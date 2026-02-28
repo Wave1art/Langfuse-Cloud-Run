@@ -1,0 +1,29 @@
+<!-- clickhouse/config.d/99-cloudrun.xml
+     Cloud Run-specific ClickHouse overrides.
+     Merged with /etc/clickhouse-server/config.xml at startup.         -->
+<clickhouse>
+    <!-- Bind only to localhost.
+         All containers in a Cloud Run sidecar service share the same
+         network namespace, so 127.0.0.1 is reachable by all of them.
+         replace="1" removes the default 0.0.0.0 / :: listeners.       -->
+    <listen_host replace="1">127.0.0.1</listen_host>
+
+    <!-- Log to stderr only — Cloud Run captures stdout/stderr natively -->
+    <logger>
+        <level>warning</level>
+        <console>1</console>
+        <!-- Disable the file logger that ClickHouse enables by default  -->
+        <log remove="1"/>
+        <errorlog remove="1"/>
+    </logger>
+
+    <!-- Opt out of ClickHouse telemetry                                 -->
+    <send_crash_reports>
+        <enabled>false</enabled>
+    </send_crash_reports>
+
+    <!-- Allow BACKUP / RESTORE to reach out to GCS (S3-compatible API) -->
+    <backups>
+        <allowed_path>/var/lib/clickhouse/backups</allowed_path>
+    </backups>
+</clickhouse>
